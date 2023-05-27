@@ -1,15 +1,26 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"flag"
 	"fmt"
+	"github.com/prometheus/common/version"
+	"io"
+	"math/rand"
+	"os"
+	"runtime"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/cortexproject/cortex/pkg/tracing"
+	"github.com/cortexproject/cortex/pkg/util"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
+	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"gopkg.in/yaml.v2"
-	"io"
-	"os"
-	"strings"
 
 	"github.com/cortexproject/cortex/pkg/cortex"
 	"github.com/cortexproject/cortex/pkg/util/flagext"
@@ -34,13 +45,13 @@ var configHash *prometheus.GaugeVec = prometheus.NewGaugeVec(
 // TODO initialize the block storage ingester
 func main() {
 	var (
-		cfg cortex.Config
-		//eventSampleRate      int
-		//ballastBytes         int
-		//mutexProfileFraction int
-		//blockProfileRate     int
-		//printVersion         bool
-		//printModules         bool
+		cfg                  cortex.Config
+		eventSampleRate      int
+		ballastBytes         int
+		mutexProfileFraction int
+		blockProfileRate     int
+		printVersion         bool
+		printModules         bool
 	)
 
 	configFile, expandENV := parseConfigFileParameter(os.Args[1:])
@@ -62,7 +73,115 @@ func main() {
 	// Ignore -config.file and -config.expand-env here, since it was already parsed, but it's still present on command line.
 	flagext.IgnoredFlag(flag.CommandLine, configFileOption, "Configuration file to load.")
 	_ = flag.CommandLine.Bool(configExpandENV, false, "Expands ${var} or $var in config according to the values of the environment variables.")
+	flag.IntVar(&eventSampleRate, "event.sample-rate", 0, "How often to sample observability events (0 = never).")
+	flag.IntVar(&ballastBytes, "mem-ballast-size-bytes", 0, "Size of memory ballast to allocate.")
+	flag.IntVar(&mutexProfileFraction, "debug.mutex-profile-fraction", 0, "Fraction of mutex contention events that are reported in the mutex profile. On average 1/rate events are reported. 0 to disable.")
+	flag.IntVar(&blockProfileRate, "debug.block-profile-rate", 0, "Fraction of goroutine blocking events that are reported in the blocking profile. 1 to include every blocking event in the profile, 0 to disable.")
+	flag.BoolVar(&printVersion, "version", false, "Print Cortex version and exit.")
+	flag.BoolVar(&printModules, "modules", false, "List available values that can be used as target.")
 
+	usage := flag.CommandLine.Usage
+	flag.CommandLine.Usage = func() { /* don't do anything by default, we will print usage ourselves, but only when requested. */ }
+	flag.CommandLine.Init(flag.CommandLine.Name(), flag.ContinueOnError)
+
+	err := flag.CommandLine.Parse(os.Args[1:])
+	if err == flag.ErrHelp {
+		// Print available parameters to stdout, so that users can grep/less it easily.
+		flag.CommandLine.SetOutput(os.Stdout)
+		usage()
+		if !testMode {
+			os.Exit(2)
+		}
+	} else if err != nil {
+		fmt.Fprintln(flag.CommandLine.Output(), "Run with -help to get list of available parameters")
+		if !testMode {
+			os.Exit(2)
+		}
+	}
+
+	if printVersion {
+		fmt.Fprintln(os.Stdout, version.Print("Cortex"))
+		return
+	}
+
+	// Validate the config once both the config file has been loaded
+	// and CLI flags parsed.
+	err = cfg.Validate(util_log.Logger)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error validating config: %v\n", err)
+		if !testMode {
+			os.Exit(1)
+		}
+	}
+	// Continue on if -modules flag is given. Code handling the
+	// -modules flag will not start cortex.
+	if testMode && !printModules {
+		DumpYaml(&cfg)
+		return
+	}
+
+	if mutexProfileFraction > 0 {
+		runtime.SetMutexProfileFraction(mutexProfileFraction)
+	}
+	if blockProfileRate > 0 {
+		runtime.SetBlockProfileRate(blockProfileRate)
+	}
+
+	util_log.InitLogger(&cfg.Server)
+
+	// Allocate a block of memory to alter GC behaviour. See https://github.com/golang/go/issues/23044
+	ballast := make([]byte, ballastBytes)
+
+	util.InitEvents(eventSampleRate)
+
+	ctx, cancelFn := context.WithCancel(context.Background())
+	// In testing mode skip tracing setup to avoid panic due to
+	// "duplicate metrics collector registration attempted"
+	if !testMode {
+		name := "cortex"
+		if len(cfg.Target) == 1 {
+			name += "-" + cfg.Target[0]
+		}
+
+		if close, err := tracing.SetupTracing(ctx, name, cfg.Tracing); err != nil {
+			level.Error(util_log.Logger).Log("msg", "Failed to setup tracing", "err", err.Error())
+		} else {
+			defer close(ctx) // nolint:errcheck
+		}
+	}
+
+	// Initialise seed for randomness usage.
+	rand.Seed(time.Now().UnixNano())
+
+	t, err := cortex.New(cfg)
+	util_log.CheckFatal("initializing block storage ingester", err)
+
+	if printModules {
+		allDeps := t.ModuleManager.DependenciesForModule(cortex.All)
+
+		for _, m := range t.ModuleManager.UserVisibleModuleNames() {
+			ix := sort.SearchStrings(allDeps, m)
+			included := ix < len(allDeps) && allDeps[ix] == m
+
+			if included {
+				fmt.Fprintln(os.Stdout, m, "*")
+			} else {
+				fmt.Fprintln(os.Stdout, m)
+			}
+		}
+
+		fmt.Fprintln(os.Stdout)
+		fmt.Fprintln(os.Stdout, "Modules marked with * are included in target All.")
+		return
+	}
+
+	level.Info(util_log.Logger).Log("msg", "Starting Cortex", "version", version.Info())
+
+	err = t.Run()
+	cancelFn()
+
+	runtime.KeepAlive(ballast)
+	util_log.CheckFatal("running cortex", err)
 }
 
 // Parse -config.file and -config.expand-env option via separate flag set, to avoid polluting default one and calling flag.Parse on it twice.
@@ -125,4 +244,13 @@ func expandEnv(config []byte) []byte {
 		}
 		return v
 	}))
+}
+
+func DumpYaml(cfg *cortex.Config) {
+	out, err := yaml.Marshal(cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+	} else {
+		fmt.Printf("%s\n", out)
+	}
 }
